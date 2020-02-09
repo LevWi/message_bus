@@ -5,11 +5,22 @@
 #include <vector>
 #include <future>
 
+//todo Delete it
+#ifndef COMMONAPI_INTERNAL_COMPILATION
+#define COMMONAPI_INTERNAL_COMPILATION
+#endif
+
+//#include "CommonAPI/CommonAPI.hpp"
+#include "CommonAPI/Variant.hpp"
+
+#undef COMMONAPI_INTERNAL_COMPILATION
+
 using mes_id_t = std::size_t;
 
 template <class T>
 constexpr mes_id_t gen_mes_id(mes_id_t id = 0)
 {
+    //TODO static_assert ( typeid(T).hash_code() != 0 , "");
     if (id == 0) {
         return typeid(T).hash_code();
     }
@@ -17,46 +28,31 @@ constexpr mes_id_t gen_mes_id(mes_id_t id = 0)
 }
 
 
-struct MessageI {
-    virtual ~MessageI() = default;
-};
-
-
-template<class T>
-struct Message : MessageI {
-    using payload_type = T;
-
-    //Message(T&& v) : payload(std::forward<T>(v)) { }      TODO not worked well
-
-    Message(T&& v) {
-        payload = std::forward<T>(v);
-    }
-
-    T payload;
-};
-
-
-
+template<class ...Types>
 class MessageBus {
-    using Promise_t = std::promise<std::unique_ptr<MessageI>>;
-    using Future_t = std::future<std::unique_ptr<MessageI>>;
-
-    std::mutex mtx;
-
-    std::vector<std::pair<mes_id_t, Promise_t>> consumers;
-
 public:
-    template<class T>
-    struct FutureWrapper {
-        Future_t fut;
+    using Box_t = CommonAPI::Variant<Types...>;
+    using Promise_t = std::promise<Box_t>;
+    using Future_t = std::future<Box_t>;
 
-        FutureWrapper(Future_t&& f) : fut(std::forward<Future_t>(f)) {}
+    template<class T>
+    struct Order {
+        mes_id_t id;
+        Future_t fut;
+        MessageBus& bus;
+
+        Order(mes_id_t id, Future_t&& f, MessageBus& b) : id(id), fut(std::move(f)), bus(b) { }
+        Order(Order&& v) = default;
+        Order (const Order &) = delete;
+        Order& operator=(const Order &) = delete;
 
         template<class Duration = std::chrono::microseconds>
         bool wait_for(Duration period, T& value) {
             if (fut.wait_for(period) == std::future_status::ready) {
-                if (auto ptr = fut.get()) {
-                    value = std::move(static_cast<Message<T>*>(ptr.get())->payload);
+                id = 0;
+                Box_t v = fut.get();
+                if ( v.template isType<T>()) {
+                    value = std::move(v.template get<T>());
                     return true;
                 }
             }
@@ -66,25 +62,47 @@ public:
         template<class Duration = std::chrono::microseconds>
         bool wait_for(Duration period) {
             if (fut.wait_for(period) == std::future_status::ready) {
+                id = 0;
                 return true;
             }
             return false;
         }
 
-        std::unique_ptr<Message<T>> get() {
-            auto ptr = fut.get();
-            return std::unique_ptr<Message<T>>( static_cast<Message<T>*>(ptr.release()) );
+        T get() {
+            return fut.get().template get<T>();
+        }
+
+        bool get(T& v) {
+            Box_t c = fut.get();
+            if ( c.template isType<T>()) {
+                v = std::move(c.template get<T>());
+                return true;
+            }
+            return false;
+        }
+
+        Box_t get_container() {
+            return fut.get();
+        }
+
+        ~Order() {
+            if (fut.valid() && id != 0 &&
+                    fut.wait_for(std::chrono::microseconds(0)) != std::future_status::ready) {
+                bus.delete_order(id);
+            }
         }
     };
 
 
-    template<class T, mes_id_t id = 0>
-    FutureWrapper<T> add_order() {
+    template<class T>
+    Order<T> add_order(mes_id_t id = 0) {
         Promise_t prom;
-        auto fut = FutureWrapper<T>( prom.get_future() );
+        auto mid = gen_mes_id<T>(id);
+        auto ord = Order<T>(mid,  prom.get_future(), *this );
+
         std::lock_guard<std::mutex> lock(mtx);
-        consumers.push_back( std::make_pair( gen_mes_id<T>(id), std::move(prom) ) );
-        return fut;
+        consumers.push_back( std::make_pair( mid, std::move(prom) ) );
+        return ord;
     }
 
     template<class T>
@@ -94,9 +112,7 @@ public:
         const auto expected_id = gen_mes_id<T>(id);
         for(auto el = consumers.begin() ; el != consumers.end() ; el++ ) {
             if (el->first == expected_id) {
-                auto ptr = new Message<T>(std::forward<T>(value));
-                el->second.set_value( std::unique_ptr<MessageI>(
-                                          static_cast<MessageI*>( ptr ) ));
+                el->second.set_value( Box_t(std::forward<T>(value)) );
                 result = true;
                 consumers.erase(el);
                 break;
@@ -105,10 +121,26 @@ public:
         return result;
     }
 
-    auto orders_count() {
+    bool delete_order(mes_id_t id) {
+        std::lock_guard<std::mutex> lock(mtx);
+        bool result = false;
+        for(auto el = consumers.begin() ; el != consumers.end() ; el++ ) {
+            if (el->first == id) {
+                consumers.erase(el);
+                result = true;
+                break;
+            }
+        }
+        return result;
+    }
+
+    std::size_t orders_count() {
         std::lock_guard<std::mutex> lock(mtx);
         return consumers.size();
     }
+private:
+    std::mutex mtx;
+    std::vector<std::pair<mes_id_t, Promise_t>> consumers;
 };
 
 #endif // MESSAGE_BUS_H
