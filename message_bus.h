@@ -2,7 +2,7 @@
 #define MESSAGE_BUS_H
 
 #include <memory>
-#include <vector>
+#include <unordered_map>
 #include <future>
 
 //todo Delete it
@@ -10,7 +10,6 @@
 #define COMMONAPI_INTERNAL_COMPILATION
 #endif
 
-//#include "CommonAPI/CommonAPI.hpp"
 #include "CommonAPI/Variant.hpp"
 
 #undef COMMONAPI_INTERNAL_COMPILATION
@@ -20,18 +19,16 @@ using mes_id_t = std::size_t;
 template <class T>
 constexpr mes_id_t gen_mes_id(mes_id_t id = 0)
 {
-    //TODO static_assert ( typeid(T).hash_code() != 0 , "");
-    if (id == 0) {
-        return typeid(T).hash_code();
-    }
-    return id;
+    //static_assert ( typeid(T).hash_code() != 0 , "");
+    return id == 0 ? typeid(T).hash_code() : id;
 }
 
+struct None { };
 
 template<class ...Types>
 class MessageBus {
 public:
-    using Box_t = CommonAPI::Variant<Types...>;
+    using Box_t = CommonAPI::Variant<None, Types...>;
     using Promise_t = std::promise<Box_t>;
     using Future_t = std::future<Box_t>;
 
@@ -41,12 +38,13 @@ public:
         Future_t fut;
         MessageBus& bus;
 
-        Order(mes_id_t id, Future_t&& f, MessageBus& b) : id(id), fut(std::move(f)), bus(b) { }
+        Order(mes_id_t id, Future_t&& f, MessageBus& b) : id(id),
+            fut(std::forward<Future_t>(f)), bus(b) { }
         Order(Order&& v) = default;
         Order (const Order &) = delete;
         Order& operator=(const Order &) = delete;
 
-        template<class Duration = std::chrono::microseconds>
+        template<class Duration = std::chrono::milliseconds>
         bool wait_for(Duration period, T& value) {
             if (fut.wait_for(period) == std::future_status::ready) {
                 id = 0;
@@ -59,7 +57,7 @@ public:
             return false;
         }
 
-        template<class Duration = std::chrono::microseconds>
+        template<class Duration = std::chrono::milliseconds>
         bool wait_for(Duration period) {
             if (fut.wait_for(period) == std::future_status::ready) {
                 id = 0;
@@ -81,66 +79,78 @@ public:
             return false;
         }
 
-        Box_t get_container() {
+        Box_t get_box() {
             return fut.get();
         }
 
         ~Order() {
             if (fut.valid() && id != 0 &&
-                    fut.wait_for(std::chrono::microseconds(0)) != std::future_status::ready) {
+                    fut.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
                 bus.delete_order(id);
             }
         }
     };
 
-
     template<class T>
-    Order<T> add_order(mes_id_t id = 0) {
+    std::pair<Order<T>, bool> add_order(mes_id_t id = 0) {
         Promise_t prom;
         auto mid = gen_mes_id<T>(id);
         auto ord = Order<T>(mid,  prom.get_future(), *this );
 
         std::lock_guard<std::mutex> lock(mtx);
-        consumers.push_back( std::make_pair( mid, std::move(prom) ) );
-        return ord;
+        auto result = orders.emplace( std::make_pair( mid, std::move(prom) ) );
+        return std::make_pair(std::move(ord), result.second);
+    }
+
+    template<class Duration = std::chrono::milliseconds>
+    Box_t wait_for(mes_id_t id, Duration period) {
+        Promise_t prom;
+        auto fut = prom.get_future();
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            auto result = orders.emplace( std::make_pair( id, std::move(prom) ) );
+        }
+        Box_t box(None{});
+        if (fut.wait_for(period) == std::future_status::ready) {
+            box = fut.get();
+        } else {
+            std::lock_guard<std::mutex> lock(mtx);
+            orders.erase(id);
+        }
+        return box;
     }
 
     template<class T>
     bool send(T&& value, mes_id_t id = 0) {
         std::lock_guard<std::mutex> lock(mtx);
         bool result = false;
-        const auto expected_id = gen_mes_id<T>(id);
-        for(auto el = consumers.begin() ; el != consumers.end() ; el++ ) {
-            if (el->first == expected_id) {
-                el->second.set_value( Box_t(std::forward<T>(value)) );
-                result = true;
-                consumers.erase(el);
-                break;
-            }
+        auto mid = gen_mes_id<T>(id);
+        auto it = orders.find(mid);
+        if (it != orders.end()) {
+            result = true;
+            it->second->set_value( Box_t(std::forward<T>(value)) );
+            orders.erase(it);
         }
         return result;
     }
 
     bool delete_order(mes_id_t id) {
         std::lock_guard<std::mutex> lock(mtx);
-        bool result = false;
-        for(auto el = consumers.begin() ; el != consumers.end() ; el++ ) {
-            if (el->first == id) {
-                consumers.erase(el);
-                result = true;
-                break;
-            }
-        }
-        return result;
+        return orders.erase(id) != 0;
     }
 
     std::size_t orders_count() {
         std::lock_guard<std::mutex> lock(mtx);
-        return consumers.size();
+        return orders.size();
+    }
+
+    void clear() {
+        std::lock_guard<std::mutex> lock(mtx);
+        orders.clear();
     }
 private:
     std::mutex mtx;
-    std::vector<std::pair<mes_id_t, Promise_t>> consumers;
+    std::unordered_map<mes_id_t, Promise_t> orders;
 };
 
 #endif // MESSAGE_BUS_H

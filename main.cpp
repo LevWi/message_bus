@@ -1,4 +1,5 @@
 #include <iostream>
+#include <vector>
 #include "message_bus.h"
 
 using namespace std;
@@ -32,10 +33,10 @@ int main()
 
             auto order = bus.add_order<type_t>(id);
 
-            std::get< std::vector< typename bus_type_t:: template Order<type_t>>>(test_env.orders).push_back(std::move(order));
+            std::get< std::vector< typename bus_type_t:: template Order<type_t>>>(test_env.orders).push_back(std::move(order.first));
         };
 
-        for(int i = 1 ; i <= 1000 ; i++) {
+        for(int i = 1, j = 1 ; i <= 10000 ; i++) {
             int x = i;
             float y = i * 2;
             std::string z = "Test#";
@@ -45,14 +46,15 @@ int main()
             add_value(y);
             add_value(z);
 
-            add_order(i, x);
-            add_order(i, y);
-            add_order(i, z);
+            add_order(j++, x);
+            add_order(j++, y);
+            add_order(j++, z);
         }
 
         cout << "subs count = " << bus.orders_count()  << endl;
         cout << "==============================\n";
     }
+
     cout << "subs count = " << bus.orders_count()  << "\n";
 
     /*
